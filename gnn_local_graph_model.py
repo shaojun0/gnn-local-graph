@@ -217,16 +217,20 @@ class GNNLocalModel(PreTrainedModel):
         mask = (token_ids != 0)
         lengths = mask.sum(dim=1).long()
 
-        # 扁平化所有有效 tokens
+        # 扁平化所有有效 tokens（含重复）
         all_ids = torch.cat([token_ids[b, :lengths[b]] for b in range(B)])
-        h = self.embedding(all_ids)                          # [total_N, d]
+        total_N = all_ids.size(0)
+
+        # 去重：图中每个 token 类型只保留一个节点
+        unique_ids, inverse = torch.unique(all_ids, return_inverse=True)
+        h = self.embedding(unique_ids)                       # [num_unique, d]
         h = self.embed_dropout(h)
 
-        # 偏移量
+        # 偏移量（按原 total_N 切分句子范围）
         offsets = torch.zeros(B + 1, dtype=torch.long, device=device)
         offsets[1:] = lengths.cumsum(0)
 
-        # GCN layers
+        # GCN layers（在 unique 节点上建图，同句内独立）
         for adj_proj, gcn, norm in zip(
             self.adj_projections, self.gcn_convs, self.norms
         ):
@@ -237,10 +241,13 @@ class GNNLocalModel(PreTrainedModel):
                 end = offsets[b + 1].item()
                 if end <= start:
                     continue
-                h_s = h[start:end]
+                # 该句的 unique 节点索引
+                sent_node_idx = inverse[start:end].unique()
+                h_s = h[sent_node_idx]
                 adj = adj_proj(h_s)
                 ei, ew = dense_adj_to_edge(adj)
-                edge_indices.append(ei + start)
+                # 映射回全局 unique 索引
+                edge_indices.append(sent_node_idx[ei])
                 edge_weights.append(ew)
 
             if not edge_indices:
@@ -251,6 +258,9 @@ class GNNLocalModel(PreTrainedModel):
 
             h_new = gcn(h, batched_ei, batched_ew)
             h = norm(h + h_new)
+
+        # 散射回原始位置（重复 token 获得相同增强向量）
+        h = h[inverse]                                       # [total_N, d]
 
         # 恢复为 [B, L, d] padded 格式
         padded = torch.zeros(B, L, d, device=device)
@@ -356,6 +366,7 @@ if __name__ == "__main__":
     config = GNNLocalConfig(vocab_size=vocab_size, hidden_dim=hidden_dim,
                             num_layers=2, proj_dim=hidden_dim)
     model = GNNLocalModel(config)
+    model.eval()  # 固定 eval 模式，避免 dropout 影响确定性
 
     query_ids = torch.randint(1, vocab_size, (B, L))
     pos_ids = torch.randint(1, vocab_size, (B, L + 4))  # 不同长度
@@ -386,6 +397,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         model.save_pretrained(d)
         m2 = GNNLocalModel.from_pretrained(d)
+        m2.eval()
         q2, p2 = m2(query_ids, pos_ids)
         assert torch.allclose(q_emb, q2, atol=1e-5), "Roundtrip mismatch"
         print(f"  Save/load roundtrip ✓")
