@@ -98,7 +98,8 @@ def main():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--activation", default="gelu")
     p.add_argument("--temperature", type=float, default=0.07)
-    p.add_argument("--adj_mode", default="softmax", choices=["softmax", "l2norm"])
+    p.add_argument("--adj_mode", default="cosine", choices=["cosine", "cosine_qk"])
+    p.add_argument("--msg_agg", default="mean", choices=["mean", "sum"])
     p.add_argument("--bm25_k1", type=float, default=1.0)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=64)
@@ -151,6 +152,7 @@ def main():
             ff_mult=args.ff_mult, proj_dim=args.proj_dim,
             temperature=args.temperature, dropout=args.dropout,
             activation=args.activation, adj_mode=args.adj_mode,
+            msg_agg=args.msg_agg,
             bm25_k1=args.bm25_k1, lr=args.lr,
             weight_decay=args.weight_decay, max_len=args.max_len,
             batch_size=args.batch_size,

@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """
-gnn_graph_transformer.py — Graph Transformer 句向量模型
+gnn_graph_transformer.py — Graph Transformer 句向量模型 (v2)
 
 核心思路: 将标准transformer的instance-level self-attention (依赖于变长序列的softmax)
 替换为 learnable-projection-based adjacency + multi-head message passing 架构,
 在保持graph-size invariant的同时获得transformer级别的表达能力。
 
+v2 关键修复 — 真正的图大小无关邻接矩阵:
+  softmax 邻接是图大小相关的: 5个tokens和8个的softmax权重完全不同。
+  替换为 pairwise cosine similarity:
+    A_ij = |cos(W_q·h_i, W_k·h_j)|
+  这是真正的图大小无关 — A_ij 只取决于 h_i 和 h_j, 添加/删除节点不改变已有边。
+
+  Message passing 使用 degree normalization (mean aggregation):
+    msg_i = sum_j (A_ij / sum_k A_ik) * v_j
+  确保每个节点接收的是邻居的加权平均, 而非简单求和。
+
 每层操作在 unique token nodes 上:
-  1. Multi-head Graph Message Passing (learnable adjacency per head)
-     - 每个head独立学习邻接矩阵: A_i = softmax(proj @ proj.T / sqrt(d_head))
-     - 在该邻接矩阵上进行 message passing: msg = A @ (h @ W_v)
+  1. Multi-head Graph Message Passing (pairwise cosine adjacency)
+     - 每个head独立计算邻接矩阵: A_ij = |cosine(Q_i, K_j)| in [0, 1]
+     - 在该邻接矩阵上进行 message passing: msg = D^{-1} * A @ v
+     - 图大小无关: A_ij 只取决于 (h_i, h_j) 这一对
   2. FFN: Linear(d, 4d) -> GELU -> Linear(4d, d)
 
-注意: 每个句子独立建图, 使用 per-sentence unique-token graph。softmax在这里没问题,
-因为每个句子的 unique tokens 数量稳定 (5-15个), train和infer一致。
+支持两种 adjacency 模式:
+  - "cosine":     对称投影 (单 W_a, 最简洁)
+  - "cosine_qk":  非对称 Q/K (更丰富, 类似标准 transformer 但非 softmax)
 """
 import math
 import torch
@@ -22,9 +34,9 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # Config
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 class GraphTransformerConfig(PretrainedConfig):
     """Graph Transformer 句向量模型配置."""
@@ -42,8 +54,12 @@ class GraphTransformerConfig(PretrainedConfig):
         bm25_k1: float = 1.0,
         dropout: float = 0.1,
         activation: str = "gelu",
-        # adjacency mode: "softmax" or "l2norm"
-        adj_mode: str = "softmax",
+        # adjacency mode: "cosine" (pairwise, graph-size invariant)
+        #                "cosine_qk" (asymmetric Q/K, richer)
+        adj_mode: str = "cosine",
+        # message aggregation: "mean" (degree-normalized, graph-size invariant)
+        #                     "sum"  (raw sum, LayerNorm handles scale)
+        msg_agg: str = "mean",
         # 训练参数 (记录用)
         lr: float = 5e-4,
         weight_decay: float = 0.01,
@@ -64,6 +80,7 @@ class GraphTransformerConfig(PretrainedConfig):
         self.dropout = dropout
         self.activation = activation
         self.adj_mode = adj_mode
+        self.msg_agg = msg_agg
         self.lr = lr
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
@@ -76,9 +93,9 @@ class GraphTransformerConfig(PretrainedConfig):
         }
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # Submodules
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 class BM25Weighting(nn.Module):
     """BM25 tf 加权池化."""
@@ -106,38 +123,59 @@ class BM25Weighting(nn.Module):
 
 
 class GraphTransformerLayer(nn.Module):
-    """单层 Graph Transformer.
+    """单层 Graph Transformer (v2: 真正的图大小无关邻接矩阵).
 
     在 unique token nodes 上操作:
-      1. Multi-head Graph Message Passing (learnable adjacency)
+      1. Multi-head Graph Message Passing (pairwise cosine adjacency)
       2. FFN block
     使用 Pre-LN 残差连接。
 
-    图大小不变: 对任意 N 个 unique tokens 使用相同的参数。
+    关键特性 — 图大小无关邻接:
+      A_ij = |cosine(Q_i, K_j)|, 其中 Q/K 来自可学习的投影
+      A_ij 只依赖于 h_i 和 h_j 这两个节点, 不涉及其他节点。
+      添加/删除节点不会改变已有边的权重。
+
+    Message passing 默认使用 degree normalization:
+      msg_i = sum_j (A_ij / sum_k A_ik) * v_j
+    这确保 msg 是邻居的加权平均, 而非简单求和。
     """
 
     def __init__(self, dim: int, num_heads: int, ff_mult: int, dropout: float,
-                 adj_mode: str = "softmax"):
+                 adj_mode: str = "cosine", msg_agg: str = "mean"):
         super().__init__()
         assert dim % num_heads == 0, f"dim={dim} not divisible by num_heads={num_heads}"
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.adj_mode = adj_mode
+        self.msg_agg = msg_agg
 
-        # Per-head learnable adjacency projections (W_a_i) and value projections (W_v_i)
-        # Shape: [num_heads, dim, head_dim] — batched for efficiency
-        self.W_a = nn.Parameter(torch.empty(num_heads, dim, self.head_dim))
+        # Value projection (shared for all heads)
+        # Shape: [num_heads, dim, head_dim]
         self.W_v = nn.Parameter(torch.empty(num_heads, dim, self.head_dim))
 
-        # Output projection: concat heads → dim
+        # Adjacency projections
+        if adj_mode == "cosine":
+            # Symmetric: single projection — A_ij = |cos(W_a·h_i, W_a·h_j)|
+            self.W_a = nn.Parameter(torch.empty(num_heads, dim, self.head_dim))
+            self.W_q = None
+            self.W_k = None
+        elif adj_mode == "cosine_qk":
+            # Asymmetric: Q/K — A_ij = |cos(W_q·h_i, W_k·h_j)| (richer, non-symmetric)
+            self.W_q = nn.Parameter(torch.empty(num_heads, dim, self.head_dim))
+            self.W_k = nn.Parameter(torch.empty(num_heads, dim, self.head_dim))
+            self.W_a = None
+        else:
+            raise ValueError(f"Unknown adj_mode: {adj_mode}")
+
+        # Output projection: concat heads -> dim
         self.W_o = nn.Linear(dim, dim)
 
         # Layer norms (Pre-LN)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        # FFN: dim → ff_mult*dim → dim
+        # FFN: dim -> ff_mult*dim -> dim
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * ff_mult),
             nn.GELU(),
@@ -147,12 +185,68 @@ class GraphTransformerLayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # Init
-        nn.init.xavier_uniform_(self.W_a)
+        self._init_params()
+
+    def _init_params(self):
+        """Initialize projection matrices."""
+        if self.W_a is not None:
+            nn.init.xavier_uniform_(self.W_a)
+        if self.W_q is not None:
+            nn.init.xavier_uniform_(self.W_q)
+        if self.W_k is not None:
+            nn.init.xavier_uniform_(self.W_k)
         nn.init.xavier_uniform_(self.W_v)
 
+    def _compute_adjacency(self, h_norm: torch.Tensor) -> torch.Tensor:
+        """计算图大小无关的 pairwise cosine adjacency.
+
+        Args:
+            h_norm: [N_s, d] Pre-LN normalized node features
+
+        Returns:
+            A: [num_heads, N_s, N_s], A[h,i,j] in [0,1]
+               pairwise cosine similarity, 只依赖于 (i,j) 这一对
+        """
+        if self.adj_mode == "cosine":
+            # Symmetric: A_ij = |cos(W_a·h_i, W_a·h_j)|
+            proj = torch.einsum("nd,hde->hne", h_norm, self.W_a)
+            proj_norm = F.normalize(proj, p=2, dim=-1)
+            A = torch.abs(torch.einsum("hne,hme->hnm", proj_norm, proj_norm))
+        elif self.adj_mode == "cosine_qk":
+            # Asymmetric: A_ij = |cos(W_q·h_i, W_k·h_j)|
+            Q = torch.einsum("nd,hde->hne", h_norm, self.W_q)
+            K = torch.einsum("nd,hde->hne", h_norm, self.W_k)
+            Q_norm = F.normalize(Q, p=2, dim=-1)
+            K_norm = F.normalize(K, p=2, dim=-1)
+            A = torch.abs(torch.einsum("hne,hme->hnm", Q_norm, K_norm))
+        else:
+            raise ValueError(f"Unknown adj_mode: {self.adj_mode}")
+
+        return A
+
+    def _message_passing(self, A: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Message passing with optional degree normalization.
+
+        Args:
+            A: [num_heads, N_s, N_s] adjacency matrix
+            v: [num_heads, N_s, head_dim] value projections
+
+        Returns:
+            msg: [num_heads, N_s, head_dim]
+        """
+        # msg[h,i,:] = sum_j A[h,i,j] * v[h,j,:]
+        msg = torch.einsum("hnm,hme->hne", A, v)
+
+        if self.msg_agg == "mean":
+            # Degree normalization: row-normalize before message passing
+            D = A.sum(dim=-1, keepdim=True) + 1e-8  # [num_heads, N_s, 1]
+            msg = msg / D
+        # else: "sum" — raw sum, LayerNorm handles N-dependent scale
+
+        return msg
+
     def forward(self, h_s: torch.Tensor) -> torch.Tensor:
-        """对一个句子的 unique token embeddings 做图 transformer 增强.
+        """对一个句子的 unique token embeddings 做 graph transformer 增强.
 
         Args:
             h_s: [N_s, d] 该句子的 unique token embeddings (N_s = #unique tokens)
@@ -161,55 +255,40 @@ class GraphTransformerLayer(nn.Module):
             [N_s, d] 增强后的 embeddings
         """
         N_s, d = h_s.shape
-        device = h_s.device
 
         # Multi-head Graph Message Passing (Pre-LN)
         h_norm = self.norm1(h_s)
 
-        # Batched computation across heads
-        # proj: [num_heads, N_s, head_dim]
-        proj = torch.einsum("nd,hde->hne", h_norm, self.W_a)
-        v    = torch.einsum("nd,hde->hne", h_norm, self.W_v)
+        # 1. Compute graph-size-invariant adjacency: A[h,i,j] = |cosine(Q_i, K_j)|
+        A = self._compute_adjacency(h_norm)  # [num_heads, N_s, N_s]
 
-        if self.adj_mode == "softmax":
-            # A: [num_heads, N_s, N_s] — learnable adjacency per head
-            A = torch.einsum("hne,hme->hnm", proj, proj) / math.sqrt(self.head_dim)
-            A = F.softmax(A, dim=-1)
-        elif self.adj_mode == "l2norm":
-            # L2-normalized adjacency (degree-normalized for graph-size invariance)
-            # A = abs(proj @ proj.T / ||proj||²) → row-normalize
-            norm_sq = proj.norm(p=2, dim=-1).pow(2) + 1e-8  # [num_heads, N_s]
-            A = torch.abs(torch.einsum("hne,hme->hnm", proj, proj)) / norm_sq.unsqueeze(-1)
-            # Row-normalize (degree normalization)
-            A = A / (A.sum(dim=-1, keepdim=True) + 1e-8)
-        else:
-            raise ValueError(f"Unknown adj_mode: {self.adj_mode}")
+        # 2. Value projection
+        v = torch.einsum("nd,hde->hne", h_norm, self.W_v)  # [num_heads, N_s, head_dim]
 
-        # Message passing: msg = A @ v, shape [num_heads, N_s, head_dim]
-        msg = torch.einsum("hnm,hme->hne", A, v)
+        # 3. Message passing (with optional degree normalization)
+        msg = self._message_passing(A, v)  # [num_heads, N_s, head_dim]
 
-        # Reshape: [num_heads, N_s, head_dim] → [N_s, dim]
+        # 4. Reshape: [num_heads, N_s, head_dim] -> [N_s, dim]
         msg = msg.permute(1, 0, 2).contiguous().view(N_s, d)
-        h_attn = self.W_o(msg)
 
-        # Residual + dropout
-        h_s = h_s + self.dropout(h_attn)
+        # 5. Output projection + residual + dropout
+        h_s = h_s + self.dropout(self.W_o(msg))
 
-        # FFN (Pre-LN)
+        # 6. FFN (Pre-LN)
         h_s = h_s + self.dropout(self.ffn(self.norm2(h_s)))
 
         return h_s
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # GraphTransformerModel
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 
 class GraphTransformerModel(PreTrainedModel):
     """Graph Transformer 句向量模型.
 
     每个句子独立建图 (unique-token graph), 在句内做 multi-head graph message passing,
-    然后 BM25 pool + projection head → L2 归一化 → InfoNCE 对比。
+    然后 BM25 pool + projection head -> L2 归一化 -> InfoNCE 对比。
 
     用法:
         config = GraphTransformerConfig(vocab_size=16200)
@@ -240,6 +319,7 @@ class GraphTransformerModel(PreTrainedModel):
                 ff_mult=config.ff_mult,
                 dropout=config.dropout,
                 adj_mode=config.adj_mode,
+                msg_agg=getattr(config, "msg_agg", "mean"),
             )
             for _ in range(config.num_layers)
         ])
@@ -276,11 +356,8 @@ class GraphTransformerModel(PreTrainedModel):
     def _enhance_sentence(self, token_ids):
         """对一批句子的 token embeddings 做 graph transformer 增强.
 
-        token_ids: [B, L] padded
-        Returns: [B, L, d] enhanced token embeddings (padded)
-
         流程:
-          1. 展平所有有效 tokens → 去重得到 unique 节点
+          1. 展平所有有效 tokens -> 去重得到 unique 节点
           2. Embed unique 节点
           3. 对每个句子, 提取其 unique 节点, 过 GraphTransformerLayer
           4. 散射回原始位置, 恢复 padded 格式
@@ -289,48 +366,39 @@ class GraphTransformerModel(PreTrainedModel):
         device = token_ids.device
         d = self.config.hidden_dim
 
-        # 有效 token 数
         mask = (token_ids != 0)
         lengths = mask.sum(dim=1).long()
 
-        # 扁平化所有有效 tokens（含重复）
         all_ids = torch.cat([token_ids[b, :lengths[b]] for b in range(B)])
         total_N = all_ids.size(0)
 
         if total_N == 0:
             return torch.zeros(B, L, d, device=device)
 
-        # 去重：每个 unique token type 一个节点
         unique_ids, inverse = torch.unique(all_ids, return_inverse=True)
-        h = self.embedding(unique_ids)                       # [num_unique, d]
+        h = self.embedding(unique_ids)
         h = self.embed_dropout(h)
 
-        # 偏移量（按原 total_N 切分句子范围, 用于找到每句的 unique 节点）
         offsets = torch.zeros(B + 1, dtype=torch.long, device=device)
         offsets[1:] = lengths.cumsum(0)
 
-        # Graph Transformer layers (per-sentence)
         for layer in self.layers:
-            # 每句独立过 layer, 结果回填到全局 h
             new_h = h.clone()
             for b in range(B):
                 start = offsets[b].item()
                 end = offsets[b + 1].item()
                 if end <= start:
                     continue
-                # 该句的 unique 节点索引 (在全局 unique_ids 中的位置)
                 sent_node_idx = inverse[start:end].unique()
                 if sent_node_idx.numel() == 0:
                     continue
-                h_s = h[sent_node_idx]                       # [N_s, d]
-                h_s_enhanced = layer(h_s)                    # [N_s, d]
+                h_s = h[sent_node_idx]
+                h_s_enhanced = layer(h_s)
                 new_h[sent_node_idx] = h_s_enhanced
             h = new_h
 
-        # 散射回原始位置（重复 token 获得相同增强向量）
-        h = h[inverse]                                       # [total_N, d]
+        h = h[inverse]
 
-        # 恢复为 [B, L, d] padded 格式
         padded = torch.zeros(B, L, d, device=device)
         for b in range(B):
             ln = lengths[b].item()
@@ -343,27 +411,12 @@ class GraphTransformerModel(PreTrainedModel):
     # ── Forward ──
 
     def forward(self, query_ids, pos_ids, neg_ids=None):
-        """Training forward.
+        q_tokens = self._enhance_sentence(query_ids)
+        p_tokens = self._enhance_sentence(pos_ids)
 
-        Args:
-            query_ids: [B, L_q] padded
-            pos_ids:   [B, L_p] padded
-            neg_ids:   [B, L_n] optional padded
-
-        Returns:
-            q_emb: [B, proj_dim] L2-normalized query embeddings
-            p_emb: [B, proj_dim] L2-normalized positive embeddings
-            (n_emb): optional negative embeddings
-        """
-        # query 和 positive 各自独立做 graph transformer 增强
-        q_tokens = self._enhance_sentence(query_ids)         # [B, L_q, d]
-        p_tokens = self._enhance_sentence(pos_ids)           # [B, L_p, d]
-
-        # BM25 池化
         q_emb = self.bm25(q_tokens, query_ids)
         p_emb = self.bm25(p_tokens, pos_ids)
 
-        # 投影 + L2 归一化
         q_emb = F.normalize(self.proj(q_emb), p=2, dim=-1)
         p_emb = F.normalize(self.proj(p_emb), p=2, dim=-1)
 
@@ -379,7 +432,6 @@ class GraphTransformerModel(PreTrainedModel):
 
     @staticmethod
     def infonce_loss(q_emb, p_emb, neg_emb=None, temperature=0.07):
-        """InfoNCE with optional explicit negatives."""
         B = q_emb.size(0)
         sim = q_emb @ p_emb.T / temperature
         if neg_emb is not None:
@@ -391,14 +443,12 @@ class GraphTransformerModel(PreTrainedModel):
 
     @torch.no_grad()
     def encode_batch(self, token_ids):
-        """批量编码 (graph transformer 增强 → pool → proj)."""
         tokens = self._enhance_sentence(token_ids)
         pooled = self.bm25(tokens, token_ids)
         return F.normalize(self.proj(pooled), p=2, dim=-1)
 
     @torch.no_grad()
     def encode_sentence(self, token_ids):
-        """单句编码."""
         L = (token_ids != 0).sum().item()
         if L == 0:
             return torch.zeros(self.config.hidden_dim, device=token_ids.device)
@@ -420,21 +470,23 @@ class GraphTransformerModel(PreTrainedModel):
               f"off-diag={sim[~torch.eye(B, dtype=bool)].mean():.3f}")
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 # Unit Tests
-# ═══════════════════════════════════════════════════════════════
+# ============================================================================
 if __name__ == "__main__":
-    print("=== GraphTransformerModel Unit Tests ===\n")
+    print("=== GraphTransformerModel v2 Unit Tests ===")
+    print("(v2: pairwise cosine adjacency + degree-normalized msg passing)")
+    print("     truly graph-size invariant\n")
 
     vocab_size, hidden_dim = 16200, 512
     B, L_q, L_p = 8, 16, 20
 
-    # Test 1: Forward sanity check
-    print("── Test 1: Forward sanity ──")
+    # ── Test 1: Forward sanity ──
+    print("── Test 1: Forward sanity (cosine + mean agg) ──")
     config = GraphTransformerConfig(
         vocab_size=vocab_size, hidden_dim=hidden_dim,
         num_layers=4, num_heads=8, ff_mult=4, proj_dim=hidden_dim,
-        adj_mode="softmax",
+        adj_mode="cosine", msg_agg="mean",
     )
     model = GraphTransformerModel(config)
     model.eval()
@@ -446,21 +498,21 @@ if __name__ == "__main__":
     print(f"  q: {q_emb.shape}  p: {p_emb.shape}")
     print(f"  q norms: {q_emb.norm(dim=1).mean():.4f}  "
           f"p norms: {p_emb.norm(dim=1).mean():.4f}")
-    assert q_emb.shape == (B, hidden_dim), f"Bad q shape: {q_emb.shape}"
-    assert p_emb.shape == (B, hidden_dim), f"Bad p shape: {p_emb.shape}"
-    print("  ✓ Forward shapes correct, embeddings normalized")
+    assert q_emb.shape == (B, hidden_dim)
+    assert p_emb.shape == (B, hidden_dim)
+    print("  OK Forward shapes correct, embeddings normalized")
 
-    # Test 2: Loss check (random init should be ~ln(B))
+    # ── Test 2: Loss check ──
     print("\n── Test 2: Loss check ──")
     loss = model.infonce_loss(q_emb, p_emb)
     baseline = math.log(B)
     print(f"  Loss: {loss:.4f}  (baseline ln({B})={baseline:.2f})")
     if 0.5 * baseline < loss < 2.0 * baseline:
-        print(f"  ✓ Loss in expected range [{0.5*baseline:.1f}, {2.0*baseline:.1f}]")
+        print(f"  OK Loss in expected range")
     else:
-        print(f"  ⚠ Loss outside expected range (check for collapse)")
+        print(f"  WARN Loss outside expected range")
 
-    # Test 3: Gradient flow
+    # ── Test 3: Gradient flow ──
     print("\n── Test 3: Gradient flow ──")
     model.train()
     q_emb_train, p_emb_train = model(query_ids, pos_ids)
@@ -474,16 +526,15 @@ if __name__ == "__main__":
             grad_params += 1
             if param.grad.norm() == 0:
                 zero_grad_params += 1
-                print(f"  ⚠ Zero grad: {name}")
+                print(f"  WARN Zero grad: {name}")
 
     frozen = sum(1 for _, p in model.named_parameters() if p.grad is None)
     print(f"  Params with gradient: {grad_params}, Frozen: {frozen}")
-    print(f"  Zero-gradient params: {zero_grad_params}")
     assert frozen == 0, f"Found {frozen} frozen params"
     assert zero_grad_params == 0, f"Found {zero_grad_params} zero-gradient params"
-    print("  ✓ All parameters receiving gradients")
+    print("  OK All parameters receiving gradients")
 
-    # Test 4: Save/load roundtrip
+    # ── Test 4: Save/load roundtrip ──
     print("\n── Test 4: Save/load roundtrip ──")
     model.eval()
     q_emb_ref, p_emb_ref = model(query_ids, pos_ids)
@@ -500,85 +551,127 @@ if __name__ == "__main__":
         diff_q = (q_emb_ref - q2).abs().max().item()
         diff_p = (p_emb_ref - p2).abs().max().item()
         print(f"  Max diff q: {diff_q:.2e}, p: {diff_p:.2e}")
-        assert torch.allclose(q_emb_ref, q2, atol=1e-5), f"Roundtrip mismatch q: {diff_q}"
-        assert torch.allclose(p_emb_ref, p2, atol=1e-5), f"Roundtrip mismatch p: {diff_p}"
-        print("  ✓ Save/load roundtrip matches")
+        assert torch.allclose(q_emb_ref, q2, atol=1e-5)
+        assert torch.allclose(p_emb_ref, p2, atol=1e-5)
+        print("  OK Save/load roundtrip matches")
 
-    # Test 5: Token dedup (同一句内重复token应得到相同embedding)
+    # ── Test 5: Token dedup ──
     print("\n── Test 5: Token dedup correctness ──")
-    # 构造一个句子: [5, 5, 7, 7, 9] — token 5 和 7 重复
     dedup_ids = torch.tensor([[5, 5, 7, 7, 9, 0, 0, 0]], dtype=torch.long)
     model.eval()
-    enhanced = model._enhance_sentence(dedup_ids)  # [1, 8, d]
-    tok_5_0 = enhanced[0, 0]  # first occurrence of 5
-    tok_5_1 = enhanced[0, 1]  # second occurrence of 5
-    tok_7_0 = enhanced[0, 2]  # first occurrence of 7
-    tok_7_1 = enhanced[0, 3]  # second occurrence of 7
-    tok_9   = enhanced[0, 4]  # unique 9
-    tok_0   = enhanced[0, 5]  # padding
-
-    sim_5 = F.cosine_similarity(tok_5_0, tok_5_1, dim=0)
-    sim_7 = F.cosine_similarity(tok_7_0, tok_7_1, dim=0)
-    sim_diff = F.cosine_similarity(tok_5_0, tok_7_0, dim=0)
+    enhanced = model._enhance_sentence(dedup_ids)
+    sim_5 = F.cosine_similarity(enhanced[0, 0], enhanced[0, 1], dim=0)
+    sim_7 = F.cosine_similarity(enhanced[0, 2], enhanced[0, 3], dim=0)
+    sim_diff = F.cosine_similarity(enhanced[0, 0], enhanced[0, 2], dim=0)
     print(f"  Same token (5) cosine sim: {sim_5:.6f} (expect ~1.0)")
     print(f"  Same token (7) cosine sim: {sim_7:.6f} (expect ~1.0)")
-    print(f"  Diff tokens (5 vs 7) cosine sim: {sim_diff:.6f} (expect < 1.0)")
-    assert sim_5 > 0.9999, f"Same token 5 mismatch: {sim_5}"
-    assert sim_7 > 0.9999, f"Same token 7 mismatch: {sim_7}"
+    print(f"  Diff tokens (5 vs 7) cosine sim: {sim_diff:.6f}")
+    assert sim_5 > 0.9999
+    assert sim_7 > 0.9999
     assert torch.all(enhanced[0, 5:] == 0), "Padding should be zero"
-    print("  ✓ Token dedup works: identical tokens get identical embeddings")
+    print("  OK Token dedup works: identical tokens get identical embeddings")
 
-    # Test 6: encode_batch / encode_sentence
-    print("\n── Test 6: encode API ──")
+    # ── Test 6: Adjacency invariance (direct test) ──
+    print("\n── Test 6: Adjacency matrix invariance (KEY TEST) ──")
+    model.eval()
+    # Build two graphs that share nodes and verify A_ij for shared nodes is identical
+    # Graph A: tokens [10, 20, 30] -> 3 nodes
+    ids_3 = torch.tensor([[10, 20, 30, 0, 0, 0, 0, 0]], dtype=torch.long)
+    # Graph B: tokens [10, 20, 30, 40, 50] -> 5 nodes (first 3 are same)
+    ids_5 = torch.tensor([[10, 20, 30, 40, 50, 0, 0, 0]], dtype=torch.long)
+
+    # Get the first layer's adjacency computation directly
+    # We need raw unique embeddings for both graphs
+    B3, L3 = ids_3.shape; B5, L5 = ids_5.shape
+    len3 = (ids_3[0] != 0).sum().item()
+    len5 = (ids_5[0] != 0).sum().item()
+    unique3, _ = torch.unique(ids_3[0, :len3], return_inverse=True)
+    unique5, _ = torch.unique(ids_5[0, :len5], return_inverse=True)
+
+    emb3 = model.embed_dropout(model.embedding(unique3))
+    emb5 = model.embed_dropout(model.embedding(unique5))
+
+    # First layer adjacency for both graphs
+    layer = model.layers[0]
+    with torch.no_grad():
+        h3_norm = layer.norm1(emb3)
+        h5_norm = layer.norm1(emb5)
+        A3 = layer._compute_adjacency(h3_norm)  # [H, 3, 3]
+        A5 = layer._compute_adjacency(h5_norm)  # [H, 5, 5]
+
+    # A5[:3, :3] should equal A3 (same nodes, same adjacency weights)
+    diff_adj = (A5[:, :3, :3] - A3).abs().max().item()
+    print(f"  Max A_ij diff for shared nodes (3 vs 5 graph): {diff_adj:.2e}")
+    assert diff_adj < 1e-6, (
+        f"Adjacency invariance FAILED: diff={diff_adj:.2e}. "
+        f"Adding nodes changed adjacency weights between existing nodes"
+    )
+    print("  *** ADJACENCY MATRIX INVARIANCE VERIFIED ***")
+    print("  A_ij for shared nodes is IDENTICAL regardless of graph size")
+
+    # ── Test 7: encode API ──
+    print("\n── Test 7: encode API ──")
     enc_batch = model.encode_batch(query_ids)
     enc_single = model.encode_sentence(query_ids[0])
     print(f"  encode_batch: {enc_batch.shape}")
     print(f"  encode_single: {enc_single.shape}")
-    assert torch.allclose(enc_batch[0], enc_single, atol=1e-5), "encode mismatch"
-    print("  ✓ encode_batch and encode_sentence consistent")
+    assert torch.allclose(enc_batch[0], enc_single, atol=1e-5)
+    print("  OK encode_batch and encode_sentence consistent")
 
-    # Test 7: neg_ids
-    print("\n── Test 7: Negatives ──")
+    # ── Test 8: Negatives ──
+    print("\n── Test 8: Negatives ──")
     neg_ids = torch.randint(1, vocab_size, (B, L_q))
     q3, p3, n3 = model(query_ids, pos_ids, neg_ids)
     print(f"  q: {q3.shape}, p: {p3.shape}, neg: {n3.shape}")
     loss_neg = model.infonce_loss(q3, p3, n3)
     print(f"  Loss with negs: {loss_neg:.4f}")
-    print("  ✓ Negatives forward OK")
+    print("  OK Negatives forward OK")
 
-    # Test 8: Variable length edges
-    print("\n── Test 8: Variable lengths ──")
+    # ── Test 9: Variable length edges ──
+    print("\n── Test 9: Variable lengths ──")
     var_ids = torch.zeros(8, 8, dtype=torch.long)
     for i in range(8):
         var_ids[i, :i+1] = torch.randint(1, vocab_size, (i+1,))
     enc_var = model.encode_batch(var_ids)
     print(f"  Variable-length encode: {enc_var.shape}")
-    print("  ✓ Variable length handled")
+    print("  OK Variable length handled")
 
-    # Test 9: l2norm adjacency mode
-    print("\n── Test 9: L2-normalized adjacency ──")
-    config_l2 = GraphTransformerConfig(
+    # ── Test 10: cosine_qk mode ──
+    print("\n── Test 10: Asymmetric Q/K mode (cosine_qk) ──")
+    config_qk = GraphTransformerConfig(
         vocab_size=vocab_size, hidden_dim=hidden_dim,
         num_layers=2, num_heads=4, ff_mult=4, proj_dim=hidden_dim,
-        adj_mode="l2norm",
+        adj_mode="cosine_qk", msg_agg="mean",
     )
-    model_l2 = GraphTransformerModel(config_l2)
-    model_l2.eval()
-    q_l2, p_l2 = model_l2(query_ids, pos_ids)
-    loss_l2 = model_l2.infonce_loss(q_l2, p_l2)
-    print(f"  q: {q_l2.shape}, loss: {loss_l2:.4f}")
-    grad_params_l2 = 0
-    model_l2.train()
-    q_l2t, p_l2t = model_l2(query_ids, pos_ids)
-    model_l2.infonce_loss(q_l2t, p_l2t).backward()
-    zero_grad = sum(1 for _, p in model_l2.named_parameters()
+    model_qk = GraphTransformerModel(config_qk)
+    model_qk.eval()
+    q_qk, p_qk = model_qk(query_ids, pos_ids)
+    loss_qk = model_qk.infonce_loss(q_qk, p_qk)
+    print(f"  q: {q_qk.shape}, loss: {loss_qk:.4f}")
+    model_qk.train()
+    q_qkt, p_qkt = model_qk(query_ids, pos_ids)
+    model_qk.infonce_loss(q_qkt, p_qkt).backward()
+    zero_grad = sum(1 for _, p in model_qk.named_parameters()
                     if p.grad is None or p.grad.norm() == 0)
     print(f"  Frozen/zero-grad: {zero_grad}")
-    assert zero_grad == 0, f"Zero grad in l2norm mode"
-    print("  ✓ L2-norm adjacency mode works")
+    assert zero_grad == 0
+    print("  OK cosine_qk mode works with full gradient flow")
 
-    # Final diagnostic
+    # ── Test 11: Adjacency invariance for Q/K mode ──
+    print("\n── Test 11: Adjacency invariance (cosine_qk) ──")
+    model_qk.eval()
+    with torch.no_grad():
+        h3_norm_qk = model_qk.layers[0].norm1(emb3)
+        h5_norm_qk = model_qk.layers[0].norm1(emb5)
+        A3_qk = model_qk.layers[0]._compute_adjacency(h3_norm_qk)
+        A5_qk = model_qk.layers[0]._compute_adjacency(h5_norm_qk)
+    diff_qk = (A5_qk[:, :3, :3] - A3_qk).abs().max().item()
+    print(f"  Max A_ij diff for shared nodes: {diff_qk:.2e}")
+    assert diff_qk < 1e-6, "Q/K adjacency invariance FAILED"
+    print("  OK Q/K adjacency also graph-size invariant")
+
+    # ── Diagnostic ──
     print("\n── Diagnostic ──")
     model.diagnostic(query_ids, pos_ids)
 
-    print("\n✅ All tests passed")
+    print("\n*** All tests passed ***")
